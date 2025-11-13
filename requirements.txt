@@ -1,0 +1,11 @@
+Django>=5.0
+channels>=4.0
+channels-redis>=4.2.0
+pyaudio>=0.2.14
+webrtcvad-wheels>=2.0.14
+pydub>=0.25.1
+speechrecognition>=3.10.4
+gtts>=2.5.3
+openai>=1.45.0
+numpy>=1.26.4
+redis>=5.0.8
