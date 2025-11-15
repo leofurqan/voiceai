@@ -21,58 +21,13 @@
     </div>
 
     <script>
-      // === GLOBAL VARIABLES ===
       let ws = null;
       let mediaStream = null;
       let captureContext = null;
       let scriptNode = null;
-      let playbackContext = null;
       let audioChunks = [];
-      let isPlaying = false;
-      let nextStartTime = 0;
+      let currentAudio = null;
 
-      // === PLAYBACK ENGINE ===
-      function initPlaybackContext() {
-        if (!playbackContext || playbackContext.state === "closed") {
-          playbackContext = new (window.AudioContext ||
-            window.webkitAudioContext)({
-            sampleRate: 16000,
-          });
-          nextStartTime = playbackContext.currentTime;
-        }
-      }
-
-      function playNextChunk() {
-        if (audioChunks.length === 0 || !isPlaying) {
-          isPlaying = false;
-          return;
-        }
-
-        const buffer = audioChunks.shift();
-        const int16 = new Int16Array(buffer);
-        const float32 = new Float32Array(int16.length);
-
-        for (let i = 0; i < int16.length; i++) {
-          float32[i] = int16[i] / 32768.0;
-        }
-
-        const audioBuffer = playbackContext.createBuffer(
-          1,
-          float32.length,
-          16000
-        );
-        audioBuffer.copyToChannel(float32, 0);
-
-        const source = playbackContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(playbackContext.destination);
-        source.start(nextStartTime);
-        nextStartTime += audioBuffer.duration;
-
-        source.onended = playNextChunk;
-      }
-
-      // === MAIN START FUNCTION ===
       async function startAudio() {
         try {
           console.log("Requesting microphone...");
@@ -106,14 +61,13 @@
 
           // WEBSOCKET
           ws = new WebSocket("ws://" + window.location.host + "/ws/voice/");
-          initPlaybackContext(); // ← INIT EARLY
 
           ws.onopen = () => {
             console.log("WS CONNECTED");
             updateStatus("Connected", "green");
           };
 
-          ws.onmessage = (e) => {
+          ws.onmessage = async (e) => {
             if (typeof e.data === "string") {
               const msg = JSON.parse(e.data);
 
@@ -136,33 +90,42 @@
                 if (avgEl) avgEl.textContent = msg.avg;
               } else if (msg.type === "interrupt") {
                 console.log("AI INTERRUPTED");
+                if (currentAudio) {
+                  currentAudio.pause();
+                  currentAudio = null;
+                }
                 audioChunks = [];
-                isPlaying = false;
-                nextStartTime = playbackContext.currentTime;
               } else if (msg.type === "start_audio") {
                 console.log("AI SPEAKING...");
                 audioChunks = [];
-                isPlaying = false;
-                nextStartTime = playbackContext.currentTime;
+                if (currentAudio) {
+                  currentAudio.pause();
+                  currentAudio = null;
+                }
               } else if (msg.type === "end_audio") {
                 console.log("AI FINISHED");
+                // Combine all MP3 chunks and play
                 if (audioChunks.length > 0) {
-                  isPlaying = true;
-                  playNextChunk();
+                  const blob = new Blob(audioChunks, { type: "audio/mp3" });
+                  const url = URL.createObjectURL(blob);
+                  currentAudio = new Audio(url);
+                  currentAudio
+                    .play()
+                    .then(() => {
+                      URL.revokeObjectURL(url);
+                    })
+                    .catch((err) => {
+                      console.error("Audio play failed:", err);
+                    });
+                  audioChunks = [];
                 }
               } else if (msg.type === "error") {
                 console.error("Server error:", msg.text);
               }
             } else {
-              // PCM CHUNK
-              e.data.arrayBuffer().then((buffer) => {
-                audioChunks.push(buffer);
-                // Start playing on first chunk
-                if (!isPlaying && audioChunks.length === 1) {
-                  isPlaying = true;
-                  playNextChunk();
-                }
-              });
+              // MP3 AUDIO CHUNK - just collect chunks
+              const arrayBuffer = await e.data.arrayBuffer();
+              audioChunks.push(arrayBuffer);
             }
           };
 
@@ -185,10 +148,12 @@
         if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
         if (scriptNode) scriptNode.disconnect();
         if (captureContext) captureContext.close();
-        if (playbackContext) playbackContext.close();
+        if (currentAudio) {
+          currentAudio.pause();
+          currentAudio = null;
+        }
         if (ws) ws.close();
         audioChunks = [];
-        isPlaying = false;
         console.log("STOPPED");
       }
 

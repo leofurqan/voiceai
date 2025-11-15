@@ -7,7 +7,7 @@ import numpy as np
 from channels.generic.websocket import AsyncWebsocketConsumer
 from pydub import AudioSegment
 import webrtcvad
-from openai import OpenAI
+from openai import AsyncOpenAI
 from decouple import config
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,8 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         self.silence_frames = 0
         self.rms_history = []
         self.speaking_task = None
-        self.client = OpenAI(api_key=config("OPENAI_API_KEY"))
+        self.client = AsyncOpenAI(api_key=config("OPENAI_API_KEY"))
+        self.tts_voice = "shimmer"
 
     async def connect(self):
         await self.accept()
@@ -94,36 +95,32 @@ class VoiceConsumer(AsyncWebsocketConsumer):
     async def handle_speech(self, audio_bytes: bytes):
         logger.info(f"Processing {len(audio_bytes)} bytes")
         try:
-            # --- Whisper STT ---
+            # --- Whisper STT (Async) ---
             seg = AudioSegment(data=audio_bytes, sample_width=2, frame_rate=16000, channels=1)
             buf = io.BytesIO()
             seg.export(buf, format="wav")
             buf.seek(0)
 
-            text = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=("speech.wav", buf, "audio/wav")
-                ).text.strip()
+            # CORRECT: await the coroutine, then access .text
+            transcription = await self.client.audio.transcriptions.create(
+                model="whisper-1",
+                file=("speech.wav", buf, "audio/wav")
             )
+            text = transcription.text.strip()
             await self.send(text_data=json.dumps({"type": "transcript", "text": text}))
             logger.info(f"User: {text}")
 
-            # --- GPT-4o-mini ---
-            chat_resp = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": text}],
-                    max_tokens=80,
-                    temperature=0.7
-                )
+            # --- GPT-4o-mini (Async) ---
+            chat_completion = await self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": text}],
+                max_tokens=80,
+                temperature=0.7
             )
-            ai_text = chat_resp.choices[0].message.content.strip()
+            ai_text = chat_completion.choices[0].message.content.strip()
             await self.send(text_data=json.dumps({"type": "ai_text", "text": ai_text}))
 
-            # --- Stream OpenAI TTS ---
+            # --- Stream OpenAI TTS (Async) ---
             self.speaking_task = asyncio.create_task(self.stream_openai_tts(ai_text))
 
         except Exception as e:
@@ -133,25 +130,23 @@ class VoiceConsumer(AsyncWebsocketConsumer):
     async def stream_openai_tts(self, text: str):
         try:
             await self.send(text_data=json.dumps({"type": "start_audio"}))
-            logger.info("Streaming OpenAI TTS...")
-
-            with self.client.audio.speech.with_streaming_response.create(
-                model="tts-1",
-                voice="alloy",
-                input=text
+            
+            async with self.client.audio.speech.with_streaming_response.create(
+                model="tts-1-hd",
+                voice="nova",  # Female voice
+                input=text,
+                response_format="mp3",  # Change to MP3
+                speed=0.95,
             ) as response:
-                async for chunk in response.iter_bytes(chunk_size=1024):
+                async for chunk in response.iter_bytes(1024):
                     if not self.speaking_task:
                         break
                     await self.send(bytes_data=chunk)
                     await asyncio.sleep(0.01)
-
+            
             await self.send(text_data=json.dumps({"type": "end_audio"}))
-            logger.info("TTS finished")
-
+        
         except asyncio.CancelledError:
-            logger.info("TTS interrupted")
+            raise
         except Exception as e:
             logger.error(f"TTS error: {e}")
-        finally:
-            self.speaking_task = None
